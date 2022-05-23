@@ -1,0 +1,1049 @@
+---
+title: "Graphical Gaussian Process"
+author: "Debangan Dey"
+date: "9/7/2021"
+header-includes:
+   - \usepackage{amsmath}
+output:
+    bookdown::html_document2:
+      toc: true
+      toc_float: true
+bibliography: ref.bib  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache=TRUE)
+```
+
+
+# Prerequisite libraries and functions
+
+```{r, results='hide', message= FALSE, warning=FALSE}
+ccc = 5 # cache_indicator
+
+rm(list=ls())
+# load packages
+pkgs = c("tidyverse","BRISC","igraph","gRbase","foreach","Matrix","sparseMVN","MBA","plotly","RBGL","mvtnorm","mgcv","coda","tictoc")
+lapply(pkgs, require, character.only = TRUE)
+#Rcpp::sourceCpp('rcpprnorm.cpp')
+
+# Calculate multivariate normal likelihood with precision matrix K and sample covariance matrix S.
+ellK <- function (K, S, n=1)
+{
+  value <- (n/2) * (as.numeric(determinant(K,logarithm = TRUE)$mod) - sum(rowSums(K * S)))
+  return(value)
+}
+
+# Calculate Matern cross-covariance with distance u
+matern <- function (u, phi, kappa)
+{
+  if (is.vector(u))
+    names(u) <- NULL
+  if (is.matrix(u))
+    dimnames(u) <- list(NULL, NULL)
+  uphi <- u/phi
+  uphi <- ifelse(u > 0, (((2^(-(kappa - 1)))/ifelse(0, Inf,
+                                                    gamma(kappa))) * (uphi^kappa) * besselK(x = uphi, nu = kappa)),
+                 1)
+  uphi[u > 600 * phi] <- 0
+  return(uphi)
+}
+
+# Propose a new cross-correlation parameter and update the current covariance matrix.
+fill.offdiagonal.one <- function(theta,m){
+  clq.match <- which(unlist(lapply(clqs,function(x){all(!is.na(match(as.numeric(clqs_2[[m]]),as.numeric(x))))}))>0)
+  sep.match <- which(unlist(lapply(seps,function(x){all(!is.na(match(as.numeric(clqs_2[[m]]),as.numeric(x))))}))>0)
+  clq.ind <- lapply(clqs[clq.match],function(x){match(as.numeric(clqs_2[[m]]),as.numeric(x))})
+  sep.ind <- lapply(seps[sep.match],function(x){match(as.numeric(clqs_2[[m]]),as.numeric(x))})
+
+  v <- sort(clqs_2[[m]])
+  sig <- sqrt(sigmahat.mat[v[1],v[1]] * sigmahat.mat[v[2],v[2]]) *( (phihat.mat[v[1],v[1]]^nuhat.mat[v[1],v[1]]) * (phihat.mat[v[2],v[2]]^nuhat.mat[v[2],v[2]])) * ((1/ phihat.mat[v[1],v[2]]) ^(2*nuhat.mat[v[1],v[2]])) * theta[m]
+  sigmahat1.mat <- sigmahat.mat
+  sigmahat1.mat[v[1],v[2]] <- sigmahat1.mat[v[2],v[1]] <- sig
+  Stemp <-sig *matern(D,phi= 1/phihat.mat[v[1],v[2]], kappa= nuhat.mat[v[1],v[2]])
+
+  Stemp.clq <- Slist.clq
+  Stemp.sep <- Slist.sep
+  Rtemp.clq <- Rlist.clq
+  Rtemp.sep <- Rlist.sep
+
+  for(i in 1:length(clq.match)){
+    v <- clq.ind[[i]]
+    idx=c(((v[1]-1)*n+1):(v[1]*n))
+    jdx=c(((v[2]-1)*n+1):(v[2]*n))
+    Stemp.clq[[clq.match[i]]][idx,jdx] <- Stemp
+    Stemp.clq[[clq.match[i]]][jdx,idx] <- Stemp
+    Rtemp.clq[[clq.match[i]]][v[1],v[2]] <- Rtemp.clq[[clq.match[i]]][v[2],v[1]] <- theta[m]
+  }
+
+  if(length(sep.match)>0){
+    for(i in 1:length(sep.match)){
+      v <- sep.ind[[i]]
+      idx=c(((v[1]-1)*n+1):(v[1]*n))
+      jdx=c(((v[2]-1)*n+1):(v[2]*n))
+      Stemp.sep[[sep.match[i]]][idx,jdx] <- Stemp
+      Stemp.sep[[sep.match[i]]][jdx,idx] <- Stemp
+      Rtemp.sep[[sep.match[i]]][v[1],v[2]] <- Rtemp.sep[[sep.match[i]]][v[2],v[1]] <- theta[m]
+    }
+  }
+  return(list(Slc=Stemp.clq,Sls=Stemp.sep,Rlc=Rtemp.clq,Rls=Rtemp.sep,sigmahat=sigmahat1.mat))
+}
+
+# Calculate new likelihood based on the proposed cross-correlation parameter
+comp.lik.oneedge <- function(t,S.clq,S.sep,R.clq,R.sep){
+  clq.match <- clqmatchedge[[t]]
+  sep.match <- sepmatchedge[[t]]
+  y=unlist(wl)
+  n=length(y)/q
+  m = 1
+
+  k.store <- list()
+  k.sep.store <- list()
+
+  max.clq.length <- max(sapply(clqs[clq.match],length))
+
+  lclq <- lsep <- NULL
+
+  if(max.clq.length > 2){
+    pdind.clq <- unlist(lapply(clq.match,function(x){
+      slanczos(R.clq[[x]],k=1,kl=1)$val[2]}))
+
+    pdind.sep <- NULL
+    if(length(sep.match)>0){
+      pdind.sep <- unlist(lapply(sep.match,function(x){
+        slanczos(R.sep[[x]],k=1,kl=1)$val[2]}))}
+
+    pdind <- c(pdind.clq,pdind.sep)
+  } else {
+    pdind <- 1}
+
+  if(all(pdind>0)){
+    lclq <- unlist(lapply(clq.match,function(l){
+      kdummy <- rcppeigen_invert_matrix(S.clq[[l]])
+      Sy=Sy.clq.list[[l]]
+      value <- ellK(K=kdummy, S=Sy, n=1)
+      value}))
+
+    if(length(sep.match)>0){
+      lsep <- unlist(lapply(sep.match,function(l){
+        kdummy <- rcppeigen_invert_matrix(S.sep[[l]])
+        Sy=Sy.sep.list[[l]]
+        value <- ellK(K=kdummy, S=Sy, n=1)
+        value}))
+    } else {
+      lsep =0
+    }
+    val <- sum(lclq) - sum(lsep)
+  } else {
+    val <- -10^26
+  }
+  return(list(lik=-val,lclq=lclq,lsep=lsep))
+}
+
+# Calculate likelihood of multivariate normal which respects a decomposable graph with clique = clqs, separator = seps
+decomp_ips_par <- function(S,q,clqs=clqs, seps=seps){
+  k.store <- list()
+  k.sep.store <- list()
+  n <- ncol(S)/q
+  S <- (S + t(S))/2
+
+  kclq <- foreach(l=1:length(clqs),.combine='+',.export=c("clqs","seps"),.packages = "FastGP") %do%{
+    varsub <- clqs[[l]]
+    sub <- unlist(lapply(varsub,function(x){c(((x-1)*n+1):(x*n))}))
+    kdummy <- matrix(0,ncol=n*q,nrow=n*q)
+    kdummy[sub,sub]=rcppeigen_invert_matrix(S[sub,sub])
+    kdummy
+  }
+
+  ksep <- foreach(l=2:length(seps),.combine='+',.export=c("clqs","seps"),.packages = "FastGP") %do%
+  {
+    varsub <- seps[[l]]
+    sub <- unlist(lapply(varsub,function(x){c(((x-1)*n+1):(x*n))}))
+    kdummy <- matrix(0,ncol=n*q,nrow=n*q)
+    kdummy[sub,sub] <- rcppeigen_invert_matrix(S[sub,sub])
+    kdummy
+  }
+  K <- kclq - ksep
+  return((K+t(K))/2)
+}
+
+simp.mat <- function(A){
+  d <- dim(A)
+  Am <- matrix(nrow=d[1],ncol=d[2]*d[3])
+  for(i in 1:d[1]){
+    Am[i,] <- as.numeric(t(A[i,,]))
+  }
+  return(Am)
+}
+```
+
+Here we also load a Rcpp function for faster simulation from multivariate normal distribution.
+```{Rcpp, cache=TRUE}
+#include <RcppArmadillo.h>
+// [[Rcpp::depends(RcppArmadillo)]]
+
+using namespace Rcpp;
+
+// [[Rcpp::export]]
+arma::mat mvrnormArma(int n, arma::vec mu, arma::mat sigma) {
+  int ncols = sigma.n_cols;
+  arma::mat Y = arma::randn(n, ncols);
+  return arma::repmat(mu, 1, n).t() + Y * arma::chol(sigma);
+}
+```
+
+# Introduction
+
+Abundant multivariate spatial data from the natural and environmental sciences demands research on the joint distribution of multiple spatially dependent variables (@wackernagel2013multivariate,@creswikle11,@ban14). Here, our goal is to estimate associations over spatial locations for each variable and those among the variables.
+
+In this document, we will present an example of a simulated multivariate spatial data and how we can use Graphical Gaussian processes (GGP) (@dey2021ggp) to model the data. First, we'll introduce the general multivariate spatial model, and then we will introduce a variable graph and how to simulate a Graphical Gaussian process (Matérn) for that variable graph. Next, we will lay out the estimation steps of GGP parameters and how the estimated parameters compare against the truth. 
+
+# Model
+
+Let $y(s)$ denote a $q\times 1$ vector of spatially-indexed dependent outcomes for any location $s \in \mathcal D \subset \mathbb{R}^d$ with typically $d=2$ or $3$. On our spatial domain $\mathcal D$, a multivariate spatial regression model provides a marginal spatial regression model for each outcome as follows:
+\begin{equation}
+y_i(s) = x_i(s)^{T}\beta_i + w_i(s) + \epsilon_i(s)\;,\quad i=1,2,\ldots,q,\; s \in \mathcal D
+(\#eq:mgp)
+\end{equation}
+where $y_i(s)$ is the $i$-th element of $y(s)$, $x_i(s)$ is a $p_i\times 1$ vector of predictors, $\beta_i$ is the $p_i\times 1$ vector of slopes, $w_i(s)$ is a spatially correlated process and $\epsilon_i(s) \stackrel{ind}{\sim} N(0,\tau^2_i)$ is the random error in outcome $i$. We usually assume that $\epsilon_i(s)$ are independent across $i$, whereas $w(s)=(w_1(s), w_2(s),\ldots, w_q(s))^T$ is a zero-centred multivariate Gaussian process (GP) with a zero mean and a cross-covariance function that introduces dependency across space and among the $q$ variables. Let $\mathcal S_i$ represent the collection of places where the $i-$th variable was observed. The reference set of locations for our approach is $\mathcal L = \cup_i\mathcal S_i$.
+
+The definition of $w(s)$ as the $q \times 1$ multivariate graphical Matérn GP (@dey2021ggp) with respect to a decomposable variable graph ${\mathcal G}_{\mathcal V}$ yields the distribution of each $w_i$. The marginal parameters for each component Matérn process $w_i(\cdot)$ are denoted by $\{\phi_{ii}, \sigma_{ii} | i = 1.\ldots,q\}$.
+
+It is sufficient to limit the intra-site covariance matrix $\Sigma=(\sigma_{ij})$ to be of the following form to assure a valid multivariate Matérn cross-covariance function (Theorem 1 of @apanasovich2012valid) - 
+
+\begin{equation}
+\begin{array}{cc}
+   \nu_{ij} =& \frac 12 (\nu_{ii} + \nu_{jj}) + \Delta_A (1 - A_{ij}) \mbox{ where } \Delta_A \geq 0, A=(A_{ij}) \mbox{ for all } i \geq 0, A_{ii}=1 \\
+    \sum_{i,j} c_ic_j\phi_{ij} \leq 0  &\mbox{ is a conditionally non-negative definite matrix } \\
+    \sigma_{ij} =& b_{ij} \frac{\Gamma(\frac 12 (\nu_{ii}+\nu_{jj} + d))\Gamma(\nu_{ij})}{\phi_{ij}^{2\Delta_A+\nu_{ii}+\nu_{jj}}\Gamma(\nu_{ij} + \frac d2)} \mbox{ where } \Delta_A \geq 0, \mbox{ and } B=(b_{ij}) > 0, \mbox{ i.e., is p.d.}
+\end{array}
+(\#eq:constraints)
+\end{equation} 
+This is equal to $\Sigma = (B \odot (\gamma_{ij}))$, where $\gamma_{ij}$'s are constants collecting the components in \@ref(eq:constraints) involving just $\nu_{ij}$'s and $\phi_{ij}$'s, and $\odot$ indicates the Hadamard (element-wise) product.
+
+In the following example, we'll assume $\Delta_A=0, \nu_{ij} = \frac{\nu_{ii}+\nu_{jj}}{2}$, $\phi_{ij}^2 = \frac{\phi_{ii}^2 + \phi_{jj}^2}{2}$. The constraints in \@ref(eq:constraints) simplifies to  - 
+
+\begin{equation}
+\begin{array}{cc}
+    \sigma_{ij} =& (\sigma_{ii} \sigma_{jj})^{\frac{1}{2}} * \frac{\phi_{ii}^{\nu_{ii}}\phi_{jj}^{\nu_{jj}}}{\phi_{ij}^{\nu_{ij}}}  \frac{\Gamma(\nu_{ij})}{\Gamma(\nu_{ii})^{\frac 12} \Gamma(\nu_{ij})^{\frac 12}} r_{ij} \mbox{ where }, \mbox{ and } R=(r_{ij}) > 0, \mbox{ i.e., is p.d.}
+\end{array}
+(\#eq:constraints-simp)
+\end{equation} 
+
+
+::: {#hello .greeting .message style="color: blue;"}
+We also take $\nu_{ii} = \nu_{jj} = 0.5$ in our case and hence, we only need to estimate the marginal scale ($\phi_{ii}$) and variance parameters ($\sigma_{ii}$) and cross-correlation parameters $r_{ij}$. We also assume variable graph (${\mathcal G}_{\mathcal V}$) to be decomposable.
+:::
+
+# Simulation
+
+As a first step of simulation, we need to fix a decomposable variable graph (${\mathcal G}_{\mathcal V}$). Depending on the perfect ordering of cliques in the graph, the density function of the full process can be factorized. Using this property, we can calculate the variance-covarinace matrix of the GGP and use it to simulate observation from a multivariate GGP. 
+
+## Decomposable variable graph
+
+If $\mathcal G_\mathcal V$ is decomposable, it has a perfect clique sequence\citep{lauritzen1996graphical} $\{K_1,K_2,\cdots,K_p\}$ with separators $\{S_2,\ldots,S_m\}$, and $w(\mathcal L)$'s joint density may be factorized as follows. 
+\begin{equation}
+    f_M(w(\mathcal L)) = \frac{\Pi_{m=1}^{p} f_C(w_{K_m}( \mathcal L))}{\Pi_{m=2}^{p} f_C(w_{S_m}( \mathcal L))}\;,
+(\#eq:ggp-fact-2)
+\end{equation}
+where $S_m=F_{m-1} \cap K_m$ and $F_{m-1}= K_1 \cup \cdots \cup K_{m-1}$, and 
+$f_A$ denotes the the density of a GP over $\mathcal L$  with covariance function $A$ for $A \in \{M,C\}$.
+
+::: {#hello .greeting .message style="color: blue;"}
+Here, we assume we have $10$ variables with each being observed at $250$ locations uniformly chosen from the $(0,1) \times (0,1)$ square. We assume the variable graph to be as follows - 
+:::
+
+```{r}
+ccc = 5 # cache_indicator
+q=10
+# Fix graph and plot it
+G_V <- make_graph(c(1,2,2,3,1,3,2,4,3,4,4,5,5,6,4,6,6,7,7,8,6,8,8,9,9,10,8,10),directed=FALSE)
+plot(G_V)
+A_V <- as.matrix(as_adjacency_matrix(G_V))
+```
+
+
+We calculate the perfect ordering of the cliques of the graph above and list the cliques and separators below. To visualize the decomposition, we also plot the junction tree (definition below) of the graph -
+
+::: {#hello .greeting .message style="color: blue;"}
+The **junction graph** $G$ of a decomposable graph $\mathcal G_\mathcal V$ is a complete graph with the cliques of $\mathcal G_\mathcal V$ as its nodes. Every edge in the junction graph is denoted as a link, which is also the intersection of the two cliques, and can be empty. A **spanning tree** of a graph is defined as a subgraph comprising all the vertices of the original graph and is a tree (acyclic graph). If a spanning tree $J$ of the junction graph of $G$ satisfies the following property: for any two cliques $C$ and $D$ of the graph, every node in the unique path between $C$ and $D$ in the tree contains $C \cap D$. Then $J$ is called the **junction tree** for the graph $\mathcal G_\mathcal V$. Here, the junction tree of the graph has the perfectly ordered cliques as its nodes and the separators denoted as edges.  
+:::
+
+```{r}
+ccc = 5 # cache_indicator
+# list cliques and separators
+diag(A_V) <- 0
+Dord <- rip(as(A_V,"graphNEL"))
+clqs <- lapply(Dord$cliques,as.integer)
+clqs <- lapply(clqs,sort)
+max.clq.length <- max(sapply(clqs,function(x){length(x)}))
+seps <- lapply(Dord$separators,as.integer)
+seps <- lapply(seps,sort)
+b <- lapply(clqs,function(x){x<-sort(x);c <- combn(x,2);c})
+b <- reduce(b,cbind) %>% unique(MARGIN=2)
+clqs_2 <- split(b,rep(1:ncol(b), each = nrow(b)))
+max.clq.length <- max(sapply(clqs,length))
+
+# Plot cliques in sequence
+par(mfrow=c(3,3),mar=c(3,4,2,2))
+plot(induced_subgraph(G_V,clqs[[1]]),vertex.label = clqs[[1]], vertex.size=100, main="Clique 1")
+plot(induced_subgraph(G_V,seps[[2]]),vertex.label = seps[[2]],label.cex=10, vertex.size=100, main="Separator 1")
+plot(induced_subgraph(G_V,clqs[[2]]),vertex.label = clqs[[2]],label.cex=3,vertex.size=100, main="Clique 2")
+plot(induced_subgraph(G_V,seps[[3]]),vertex.label = seps[[3]],label.cex=3,vertex.size=100, main="Separator 2")
+plot(induced_subgraph(G_V,clqs[[3]]),vertex.label = clqs[[3]],label.cex=3,vertex.size=100, main="Clique 3")
+plot(induced_subgraph(G_V,seps[[4]]),vertex.label = seps[[4]],label.cex=3,vertex.size=100, main="Separator 3")
+plot(induced_subgraph(G_V,clqs[[4]]),vertex.label = clqs[[4]],label.cex=3,vertex.size=100, main="Clique 4")
+plot(induced_subgraph(G_V,seps[[5]]),vertex.label = seps[[5]],label.cex=3,vertex.size=100, main="Separator 4")
+plot(induced_subgraph(G_V,clqs[[5]]),vertex.label = clqs[[5]],label.cex=3, vertex.size=100, main="Clique 5")
+```
+```{r}
+ccc = 5 # cache_indicator
+plot(make_tree(length(clqs),1,mode="undirected"), vertex.label=sapply(clqs,function(x){paste(x,sep=", ", collapse=", ")}), vertex.size=40, edge.label = sapply(seps[-1],function(x){paste(x,sep=", ", collapse=", ")}), title="Junction tree", label.cex=5, main="Junction tree")
+```
+
+::: {#hello .greeting .message style="color: blue;"}
+Hence, in this case, the likelihood of the decomposable GGP would be as follows - 
+\begin{equation}
+    f_M(w(\mathcal L)) = \frac{f_C(w_{(1,2,3)}(\mathcal L)) f_C(w_{(2,3,4)}(\mathcal L)) f_C(w_{(4,5,6)}(\mathcal L)) f_C(w_{(6,7,8)}(\mathcal L)) f_C(w_{(8,9,10)}(\mathcal L))}{f_C(w_{(2,3)}(\mathcal L)) f_C(w_{(4)}(\mathcal L)) f_C(w_{(6)}(\mathcal L)) f_C(w_{(8)}(\mathcal L))}\;,
+(\#eq:ggp-fact-ex)
+\end{equation}
+:::
+
+## Simulating latent GGP
+
+First we fix the marginal and cross-covariance parameters of the process. 
+
+```{r}
+ccc = 5 # cache_indicator
+set.seed(23)
+# number of locations
+n=250
+# number of variables
+q = 10
+# Generating locations on (0,1) * (0,1) plane and calculating distance matrix
+coords <- cbind(runif(n,0,1),runif(n,0,1))
+D <-  as.matrix(dist(coords))
+
+# Fixing multivariate Matern parameters
+D_B=0
+R <- matrix(runif(q^2,-1,1), ncol=q) 
+B <- matrix(rnorm(q^2,0,2), ncol=q)
+r0 <- runif(q-1,0.1,0.7)
+R_B <- cov2cor(B %*% t(B))
+nu.mat = matrix(0.5, ncol=q, nrow= q)
+phi.diag= sample(seq(1,5,length.out = q))
+sigma.diag= sample(seq(5,1,length.out = q))
+phi.mat = diag(phi.diag)
+# Creating scale matrix
+for(i in 1:(q-1)){
+  for (j in (i+1): q){
+    phi.mat[i,j]= sqrt((phi.mat[i,i]^2 + phi.mat[j,j]^2)/2) + D_B*(1-R_B[i,j])
+    phi.mat[j,i] = phi.mat[i,j]
+  }
+}
+# Creating sigma matrix  
+sigma.mat=diag(sigma.diag)
+# Cross-correlation parameters
+b <- cov2cor(R %*% t(R))
+for(i in 1:(q-1)){
+  for (j in (i+1): q){
+    sigma.mat[i,j]= sqrt(sigma.mat[i,i] * sigma.mat[j,j]) *( (phi.mat[i,i]^nu.mat[i,i]) * (phi.mat[j,j]^nu.mat[j,j])) * ((1/ phi.mat[i,j]) ^(2*nu.mat[i,j])) * b[i,j] 
+    sigma.mat[j,i] = sigma.mat[i,j]
+  }
+}
+
+# Constructing cross-covariance matrix for the process
+SIGMA <- matrix(ncol=n*q, nrow=n*q)
+
+for (i in 1:q){
+  for(j in i:q){
+    idx=c(((i-1)*n+1):(i*n))
+    jdx=c(((j-1)*n+1):(j*n))
+    SIGMA[idx,jdx] = sigma.mat[i,j]*matern(D,phi= 1/phi.mat[i,j], kappa= nu.mat[i,j])
+    SIGMA[jdx,idx] = SIGMA[idx,jdx]
+  }
+}
+# Create Cholesky decomposition
+S <- SIGMA
+```
+
+Now, the precision matrix of the GGP $w(\mathcal L)$ satisfies (Lemma 5.5 of @lauritzen1996graphical)
+\begin{equation}
+M(\mathcal L,\mathcal L)^{-1} = \sum_{m=1}^{p} [{C}_{[K_m \boxtimes \mathcal{G_L}]}^{-1}]^{\mathcal V \times \mathcal L} - \sum_{m=2}^{p} [{C}_{[S_m \boxtimes \mathcal{G_L}]}^{-1}] ^{\mathcal V \times \mathcal L}\;, %= \sum_{m=1}^{p} [{M}_{[K_m \boxtimes \mathcal{G_L}]}^{-1}] ^\mathcal V - \sum_{m=2}^{p} [{M}_{[S_m \boxtimes \mathcal{G_L}]}^{-1}] ^\mathcal V\;
+(\#eq:m-decomp)
+\end{equation}
+
+::: {#hello .greeting .message style="color: blue;"}
+The \@ref(eq:m-decomp) and \@ref(eq:ggp-fact-2) shows that inverting the full cross-covariance matrix only requires inverting the clique and separator specific covariance matrices. Hence, the computational complexity for calculating likelihood of a multivariate GGP boils down to $O(n^3 c^3)$ (here, $O(250^3 * 27)$) where $c= 3$ is the maximum size of a clique in the perfect clique ordering of the graph. On the contrary, the likelihood of a full GGP would need $O(n^3 q^3)$ complexity, i.e. $O(250^3 * 1000)$ in our case. 
+:::
+
+
+We use the \@ref(eq:m-decomp) to calculate the covariance of the latent GGP and we use it to simulate the latent process. 
+
+```{r}
+ccc = 5 # cache_indicator
+# Calculate GGP precision matrix
+K0 = decomp_ips_par(S, 10, clqs=clqs, seps = seps)
+B <- as((K0+t(K0))/2, "sparseMatrix") 
+Lk <- Cholesky(B, LDL=FALSE)
+
+rm(K0)
+rm(B)
+w0 <- rmvn.sparse(1,mu=rep(0,n*q),CH=Lk)
+```
+
+
+## Simulating multivariate spatial outcome
+
+Now we use \@ref(eq:mgp) to simulate our multivariate outcome $y_i(.), i= 1, \cdots, 10$. In order to do that, we fix some covariates $x_i(\cdot)$ and simulate error process $\eps_i(.)$ independently from $N(0,\tau^2_{ii})$. We take $\tau_{ii}^2=\tau^2=0.25$ for all $i$.
+
+```{r}
+ccc = 5 # cache_indicator
+# Covariate
+X <- rnorm(n*q,0,2)
+# Regression coefficient for covariate
+beta0 <- runif(q,-2,2)
+# Error variance
+tausq0 <- rep(0.25,q)
+# Generate error
+e0 <- rnorm(n*q,0,sqrt(tausq0[1]))
+Y <- as.numeric(t(X) %*% diag(rep(beta0,each=n)) + w0 + e0)
+X <- as.numeric(X)
+w.data <- matrix(w0,ncol=q)
+Y.data <- matrix(Y, ncol=q)
+X.data <- matrix(X, ncol=q)
+```
+
+For analyzing the prediction accuracy of our method, we randomly pick $20\%$ of the locations for each outcome variable and consider them missing. We will only be working with the training set to fit the model and judge our prediction accuracy on the test set. 
+
+```{r}
+ccc = 5 # cache_indicator
+# Fixing test set location for each variable
+test.prop <- 0.2
+test.sample <- list()
+exc <- list()
+for(k in 1:q){
+  test.sample[[k]] <- sort(sample(1:n,size=n*test.prop))
+  exc[[k]] <- test.sample[[k]] + (k-1)*n
+}
+
+# Splitting into train and test data
+Y.train <- sapply(1:q,function(x){Y.data[,x][-test.sample[[x]]]},simplify = TRUE)
+X.train <- sapply(1:q,function(x){X.data[,x][-test.sample[[x]]]},simplify = TRUE)
+X.test <- sapply(1:q,function(x){X.data[,x][test.sample[[x]]]},simplify = TRUE)
+Y.test <- sapply(1:q,function(x){Y.data[,x][test.sample[[x]]]},simplify = TRUE)
+
+```
+
+Now we visualize the surface of the training data by variables below - 
+
+```{r}
+#print("Surface plots for latent processes")
+# surf_w=list()
+# for(i in 1:q){
+#   surf_w[[i]] <- mba.surf(cbind(coords,w.data[,i]), no.X=200, no.Y=200, h=5, m=2, extend=F, b.box=c(min(coords[,1]),max(coords[,1]),min(coords[,2]),max(coords[,2])))$xyz.est
+# }
+# fig <- htmltools::tagList()
+# for(i in 1:q){
+# fig[[i]] <- plot_ly(x = surf_w[[i]]$x, y = surf_w[[i]]$y, z=surf_w[[i]]$z, type = "surface") %>% layout(title=paste("Surface plots for latent process for variable", i))
+# }
+# fig
+```
+
+```{r}
+# #"Surface plots for observed outcome")
+# surf_Y=list()
+# for(i in 1:q){
+#   surf_Y[[i]] <- mba.surf(cbind(coords,Y.data[,i]), no.X=200, no.Y=200, h=5, m=2, extend=F, b.box=c(min(coords[,1]),max(coords[,1]),min(coords[,2]),max(coords[,2])))$xyz.est
+# }
+# fig <- htmltools::tagList()
+# for(i in 1:q){
+# fig[[i]] <- plot_ly(x = surf_Y[[i]]$x, y = surf_Y[[i]]$y, z=surf_Y[[i]]$z, type = "surface") %>% layout(title=paste("Surface plots for latent process for variable", i))
+# }
+# fig
+```
+
+# Data analysis 
+
+The analysis of our simulated data can be broken down in the following steps - 
+
+1. **Marginal parameter estimation**: We estimate the marginal scale ($\phi_{ii}$), variance ($\sigma^2_{ii}$) and smoothness parameters ($\nu_{ii}$) from the component Gaussian processes. We also estimate the error variance ($\tau^2_{ii}$) for each marginal processes. 
+
+2. **Initialize Gibbs sampling**: For this step, we need three components - 
+    1. **Processing the variable graph**: We fix our variable graph for the estimation process. First we calculate cliques, separators of the graph. Then we color the nodes and edges of the graph for parallel computation purposes.
+    2. **Starting cross-correlation**: We use the estimated marginal parameters and an initial correlation parameter to start off. 
+    
+3. **Gibbs sampling**: We run our Gibbs sampler in two steps - 
+    1. **Sampling latent spatial processes** 
+    2. **Sampling latent correlations**
+    
+
+## Marginal parameter estimation
+
+1. We first estimate the marginal process parameters using **BRISC** package in R. We estimate scale ($\phi_{ii}$) and variance ($\sigma_{ii}$) parameters. We fix the marginal smoothness ($\nu_ii$) and cross-smoothness ($\nu_{ij}$) parameters at $0.5$.
+2. Same as the true cross-covariance, we calculate the cross-scale parameters as: $\phi_{ij}= \sqrt{\frac{\phi_{ii}^2 + \phi_{jj}^2}{2}}$.
+3. We estiamte the marginal regression coefficients ($\beta_i$).
+4. We estimate the marginal error varicne ($\tau_{ii}^2$). 
+
+```{r, results='hide'}
+ccc = 5 # cache_indicator
+# n: number of locations
+# q: number of variables
+# m: number of nearest neighbors considered
+# coords: a n*2 coordinate matrix of locations
+# test.sample: A list of length q storing the missing (test) locations for each variable
+# X.train: The covariate matrix (assuming one covariate here) 
+# Y.train: Observations (n*q matrix)
+# Fitting the model
+# Estimating marginal materns with BRISC
+M <- list()
+for(i in 1:q){
+  M[[i]] <- BRISC_estimation(coords[-test.sample[[i]],], x=as.matrix((X.train[,i])), y=(Y.train[,i]), n.neighbors = 15, cov.model="exponential")
+}
+
+# Fix marginal smoothness as 0.5
+nuhat.mat = matrix(0.5, ncol=q, nrow= q)
+
+# Get marginal scale parameters and calculate cross-scale parameters
+phihat.diag=  unlist(lapply(M,function(x){x$Theta[3]}))
+phihat.mat = diag(phihat.diag)
+
+for(i in 1:(q-1)){
+  for (j in (i+1): q){
+    phihat.mat[i,j]= sqrt((phihat.mat[i,i]^2 + phihat.mat[j,j]^2)/2)
+    phihat.mat[j,i] = phihat.mat[i,j]
+  }
+}
+# Regression coefficient
+beta <- unlist(lapply(M,function(x){x$Beta}))
+# Error variance
+tausq= unlist(lapply(M,function(x){x$Theta[2]}))
+
+```
+
+
+## Initialize Gibbs sampling
+
+1. **Process the variable graph**: 
+
+First, we color the nodes of the variable graph. This will allow us to simulate the latent processes belonging to the same color in parallel. 
+
+We also construct a new graph $\mathcal G_E(\mathcal G_V)=(E_\mathcal V,E^*)$ which denotes this graph on the set of edges $E_\mathcal V$, i.e., there is an edge $((i,j),(i',j'))$ in this new graph $\mathcal G_E(\mathcal G_V)$ if $\{i,i',j,j'\}$ are in some clique $K$ of $\mathcal G_V$. This allows us to facilitate parallel update of cross-correlation parameters corresponding to edges in the same color. 
+
+These two procedures are examples of chromatic Gibbs sampling. 
+
+```{r}
+ccc = 5 # cache_indicator
+# Node coloring
+g_v <- graph_from_adjacency_matrix(A_V,mode="undirected")
+g_V <- as(A_V[as.numeric(max_cardinality(g_v)$alpha),as.numeric(max_cardinality(g_v)$alpha)],"graphNEL")
+coloring <- as.numeric(sequential.vertex.coloring(g_V)$color[max_cardinality(g_v)$alpham])
+plot(g_v, vertex.color=c("Pink","Green","Yellow"))
+
+# Get cliques and separators
+diag(A_V) <- 0
+Dord <- rip(as(A_V,"graphNEL"))
+clqs <- lapply(Dord$cliques,as.integer)
+clqs <- lapply(clqs,sort)
+max.clq.length <- max(sapply(clqs,function(x){length(x)}))
+seps <- lapply(Dord$separators,as.integer)
+seps <- lapply(seps,sort)
+bb <- lapply(clqs,function(x){x<-sort(x);c <- combn(x,2);c})
+bb <- reduce(bb,cbind) %>% unique(MARGIN=2)
+clqs_2 <- split(bb,rep(1:ncol(bb), each = nrow(bb)))
+true <- unlist(lapply(clqs_2,function(x){b[x[1],x[2]]}))
+max.clq.length <- max(sapply(clqs,length))
+
+# Coloring for edges
+ne <- length(clqs_2)
+A_E <- matrix(0,nrow=ne, ncol=ne)
+if(ne >1){
+  for(i in 1:(ne-1)){
+    for(j in (i+1):ne){
+      e <- sort(union(clqs_2[[i]], clqs_2[[j]]))
+      A_E[i,j] <- any(sapply(clqs, function(x){setequal(intersect(x,e),e)}))
+      A_E[j,i] <- A_E[i,j]
+    }
+  }
+  g_e <- graph_from_adjacency_matrix(A_E,mode="undirected")
+  g_E <- as(A_E[as.numeric(max_cardinality(g_e)$alpha),as.numeric(max_cardinality(g_e)$alpha)],"graphNEL")
+  coloring_e <- as.numeric(sequential.vertex.coloring(g_E)$color[max_cardinality(g_e)$alpham])
+} else{
+  coloring_e <- 0  
+}
+
+```
+
+2.**Calculate initial cross-covariance matrix**: Start with an initial cross-correlation matrix. We Take a convex combination: $0.5*diag(q) + 0.5*cor(Y.train)$. Then we use this initial cross-correlation parameters and estimated marginal parameters to store the cross covariance matrices for cliques and separators only. 
+
+::: {#hello .greeting .message style="color: blue;"}
+The largest matrix we need to store is of size $nq_c \times nq_c$ matrix where $q_c$ is the size of maximum clique or separator)
+:::
+
+```{r}
+ccc = 5 # cache_indicator
+# Initial cross-covariance matrix
+rho=0.5
+R_V= (1-rho)*diag(q) + rho*cor(Y.train)
+R <- R_V
+# Initial cross-correlation parameters
+theta = unlist(lapply(clqs_2,function(x){R_V[x[1],x[2]]}))
+sigmahat.diag=unlist(lapply(M,function(x){x$Theta[1]}))
+sigmahat.mat=diag(sigmahat.diag)
+for(i in 1:(q-1)){
+  for (j in (i+1): q){
+    sigmahat.mat[i,j]=  sqrt(sigmahat.mat[i,i] * sigmahat.mat[j,j]) *( (phihat.mat[i,i]^nuhat.mat[i,i]) * (phihat.mat[j,j]^nuhat.mat[j,j])) * ((1/ phihat.mat[i,j]) ^(2*nuhat.mat[i,j])) * R_V[i,j] 
+    sigmahat.mat[j,i] = sigmahat.mat[i,j]
+  }
+}
+
+# Store clique and separator cross-covariances as a list
+Slist.clq <- Slist.sep <- list()
+Rlist.clq <- Rlist.sep <- list()
+
+for(k in 1:length(clqs)){
+  comp <- sort(clqs[[k]])
+  pc <- length(clqs[[k]])
+  sigmahat.sub <- sigmahat.mat[comp,comp]
+  phihat.sub <- phihat.mat[comp,comp]
+  nu.sub <- nu.mat[comp,comp]
+  Stemp <- matrix(nrow=n*pc,ncol=n*pc)
+  for (i in 1:pc){
+    for(j in i:pc){
+      idx=c(((i-1)*n+1):(i*n))
+      jdx=c(((j-1)*n+1):(j*n))
+      Stemp[idx,jdx] = sigmahat.sub[i,j]*matern(D,phi= 1/phihat.sub[i,j], kappa= nu.sub[i,j])
+      Stemp[jdx,idx] = Stemp[idx,jdx]
+    }
+  }
+  Slist.clq[[k]] <- Stemp
+  Rlist.clq[[k]] <- R[comp,comp]
+  rm(Stemp)
+}
+
+for(k in 2:length(seps)){
+  comp <- sort(seps[[k]])
+  pc <- length(seps[[k]])
+  sigmahat.sub <- as.matrix(sigmahat.mat[comp,comp])
+  phihat.sub <- as.matrix(phihat.mat[comp,comp])
+  nu.sub <- as.matrix(nu.mat[comp,comp])
+  Stemp <- matrix(nrow=n*pc,ncol=n*pc)
+  for (i in 1:pc){
+    for(j in i:pc){
+      idx=c(((i-1)*n+1):(i*n))
+      jdx=c(((j-1)*n+1):(j*n))
+      Stemp[idx,jdx] = sigmahat.sub[i,j]*matern(D,phi= 1/phihat.sub[i,j], kappa= nu.sub[i,j])
+      Stemp[jdx,idx] = Stemp[idx,jdx]
+    }
+  }
+  Slist.sep[[k]] <- Stemp
+  Rlist.sep[[k]] <- R[comp,comp]
+  rm(Stemp)
+}
+clqmatchedge <- sepmatchedge <- list()
+for(t in 1:length(clqs_2)){
+  clqmatchedge[[t]] <- which(unlist(lapply(clqs,function(x){all(!is.na(match(as.numeric(clqs_2[[t]]),as.numeric(x))))}))>0)
+  sepmatchedge[[t]] <- which(unlist(lapply(seps,function(x){all(!is.na(match(as.numeric(clqs_2[[t]]),as.numeric(x))))}))>0)
+}
+
+clqmatchvar <- sepmatchvar <- list()
+for(t in 1:q){
+  clqmatchvar[[t]] <- which(unlist(lapply(clqs,function(x){all(!is.na(match(as.numeric(t),as.numeric(x))))}))>0)
+  sepmatchvar[[t]] <- which(unlist(lapply(seps,function(x){all(!is.na(match(as.numeric(t),as.numeric(x))))}))>0)
+}
+
+# Initial latent spatial process parameters
+Yl <- list()
+Xl <- list()
+wl <- list()
+for(i in 1:q){
+  Yl[[i]] = Y.train[,i]
+  Xl[[i]] = X.train[,i]
+  wl[[i]] = numeric(n)
+  cmatch <- clqmatchvar[[i]][1]
+  imatch <- which(clqs[[cmatch[1]]]==i)
+  im <- c(((imatch-1)*n+1):(imatch*n))
+  wtemp <- as.numeric(rmvnorm(1,sigma=Slist.clq[[cmatch[1]]][im,im]))
+  wl[[i]][-test.sample[[i]]] = wtemp[-test.sample[[i]]]
+  wl[[i]][test.sample[[i]]] = wtemp[test.sample[[i]]]
+}
+
+w = unlist(wl)
+```
+
+
+## Gibbs sampling 
+
+We iteratively perform the following steps until we reach a desired number of samples ($N$) - 
+1.  **Sampling latent processes** : Using random draws from multivariate normal distribution 
+2. **Sampling correlations**: Metropolis-hastings
+3. **Jumping between graphs**: Reversible jump MCMC. 
+
+### Sampling latent processes 
+
+To update the latent random effects $w$, let $\mathcal L=\{s_1,\ldots,s_n\}$ and $o_i=\mbox{diag}(I(s_1 \in \mathcal S_i), \ldots, I(s_n \in \mathcal S_i))$ denote the vector of missing observations for the $i$-th outcome. With $X_{i}(\mathcal L) = (x_i(s_1),\ldots,x_i(s_n))^T$, $y_i(\mathcal L)$ and $w_i(\mathcal L)$ defined similarly, we obtain
+\begin{equation*}
+\begin{split}
+p(w_i(\mathcal L) | \cdot) & \sim N\left(\mathcal M_i^{-1}\mu_i, \mathcal M_i^{-1}\right)\;, \mbox{ where } \\
+\mathcal M_i & =\frac{1}{\tau_i^2}\mbox{diag}(o_i) + \sum_{K \ni i}M_{\{i\} \times \mathcal L|(K\setminus \{i\}) \times \mathcal L}^{-1} - \sum_{S \ni i}M^{-1}_{\{i\} \times \mathcal L|(S\setminus \{i\}) \times \mathcal L}\;, \\
+\mu_i &= \frac{(y_i(\mathcal L) - x_i(\mathcal L)^{T}\beta_i)\odot o_i}{\tau_i^2} + \\
+& \qquad \sum_{K \ni i}  T_{i}(K) w({(K\setminus \{i\}) \times \mathcal L}) - \sum_{S \ni i} T_i(S) w({(S\setminus \{i\}) \times \mathcal L})\;, \\
+ T_{i}(A) &= M_{\{i\} \times \mathcal L|(A\setminus \{i\}) \times \mathcal L}^{-1}  M_{\{i\} \times \mathcal L,(A\setminus \{i\}) \times \mathcal L}M_{(A\setminus \{i\}) \times \mathcal L}^{-1}, \mbox{ for } A \in \{K,S\}.\\
+% U_i(S) &= M_{\{i\} \times \mathcal L|(S\setminus \{i\}) \times \mathcal L}^{-1}  M_{(S\setminus \{i\}) \times \mathcal L,\{i\} \times \mathcal L}M_{(S\setminus \{i\}) \times \mathcal L}^{-1}.
+\end{split}\label{eqn: gibbs-sam-latent}
+\end{equation*}
+ 
+%We denote $\mathscr T_i= \mathcal L \setminus \mathscr S_i$. 
+% for a clique $K$ in variable graph $\mathcal{G_V}$, the set - $K \times \mathcal L = K \times \mathscr S$, $S \times \mathcal L= S \times \mathscr S$,
+%$i_{K}=\{K \setminus i\} \times \mathscr S$, $i \times \mathscr S_i = i_{\mathscr S}$ and $i \times \mathscr T_i= i_{\mathscr T}$, $i_{K} \cup i_{\mathscr T}= i_{K\mathscr T}$ and $i_{K} \cup i_{\mathscr S}= i_{K \times \mathcal L}$ . Also, for a clique $K$ in containing a variable $i$, let's denote  $M_{i_{{\mathscr S}.K}} = M_{i_{\mathscr S}} - M_{i_{\mathscr S}, i_{K\mathscr T}}M_{i_{K\mathscr T}}^{-1}M_{i_{K\mathscr T},i_{\mathscr S}}$ and $M_{i_{{\mathscr T}.K}} = M_{i_{\mathscr T}} - M_{i_{\mathscr T}, i_{K \times \mathcal L}}M_{i_{K \times \mathcal L}}^{-1}M_{i_{K \times \mathcal L},i_{\mathscr T}}$. 
+
+### Sampling cross-correlation parameters
+
+Requires only checking positive-definiteness of the clique-specific cross-covariance matrix and inverting it. The largest matrix inversion across all these updates is of the order $nc \times nc$, corresponding to the largest clique. The largest matrix that needs storing is also of dimension $nc \times nc$. These result in appreciable reduction of computations from any multivariate Mat\'ern model that involves $nq \times nq$ matrices and positive-definiteness checks for $q \times q$ matrices at every iteration. 
+
+1. For every correlation parameter corresponding to edges in the current graph, we draw a new correlation value from the proposal distribution.
+
+2. We accept or reject the proposal based on the Metropolis-Hastings acceptance probability. 
+
+```{r mcmc, results='hide'}
+ccc = 5 # cache_indicator
+# N: total number of MCMC samples
+N = 1000
+counter <- matrix(nrow=length(clqs_2),ncol=N)
+countertau <- countersig <- counterphi <- matrix(nrow=q,ncol=N)
+mcmc.store <- list(phi=phi.mat, sigma=sigma.mat, beta=beta0, r=true, betahat=matrix(nrow=N,ncol=q),tausq=tausq0,tausqhat=matrix(nrow=N,ncol=q),rhat=matrix(ncol=length(clqs_2),nrow=N),phihat=matrix(nrow=N,ncol=q),sigmahat=matrix(nrow=N,ncol=q),lik=matrix(nrow=N,ncol=2),
+                   w=array(dim=c(N,q,n)),
+                   ytest=Y.test,ytestpred=array(dim=c(N,q,n*(test.prop))))
+mu=rep(0,n*q)
+
+counter <- matrix(0,nrow=length(clqs_2),ncol=N)
+countersig <- counterphi <- matrix(nrow=q,ncol=N)
+lik.clq <- list()
+lik.sep <- list()
+Ytest <- list()
+
+for (j in 1:N){
+tic("totaltime")
+  
+  # Part 1, Sampling latent processes (w's): 
+ for(k in c(1:length(unique(coloring)))){
+    m = which(coloring==(k-1))
+    tic("total")
+    w.store <- lapply(m,function(t){
+      ##tic()
+      clq.match <- which(unlist(lapply(clqs,function(x){all(!is.na(match(as.numeric(t),as.numeric(x))))}))>0)
+      sep.match <- which(unlist(lapply(seps,function(x){all(!is.na(match(as.numeric(t),as.numeric(x))))}))>0)
+      o_t <- as.numeric(!c(1:n) %in% test.sample[[t]])
+      mu_t <- numeric(n)
+      mu_t[-test.sample[[t]]] <- Yl[[t]]-Xl[[t]]*beta[t]
+      if(length(clq.match)==1){
+        l=clq.match
+        varsub <- which(clqs[[l]]==t)
+        nbr <- which(clqs[[l]]!=t)
+        nbr.w <- clqs[[l]][nbr]
+        nbr.sub <- unlist(lapply(nbr,function(x){c(((x-1)*n+1):(x*n))}))
+        nbr.sub.w <- unlist(lapply(nbr.w,function(x){c(((x-1)*n+1):(x*n))}))
+        sub <- unlist(lapply(varsub,function(x){c(((x-1)*n+1):(x*n))}))
+        sub.w <- unlist(lapply(t,function(x){c(((x-1)*n+1):(x*n))}))
+        res <- list()
+        S=Slist.clq[[l]]
+        nbrsubinv <- rcppeigen_invert_matrix(S[nbr.sub,nbr.sub])
+        res[[1]] <- rcppeigen_invert_matrix(S[sub,sub] - S[sub,nbr.sub] %*% nbrsubinv %*% S[nbr.sub,sub])
+        res[[2]] <- res[[1]]%*%S[sub,nbr.sub] %*% nbrsubinv %*% w[nbr.sub.w]
+        lclq <- res
+        lclq <- list(lclq)
+        rm(res)
+      } else {
+        lclq <- lapply(clq.match,function(l){
+          ##tic()
+          varsub <- which(clqs[[l]]==t)
+          nbr <- which(clqs[[l]]!=t)
+          nbr.w <- clqs[[l]][nbr]
+          nbr.sub <- unlist(lapply(nbr,function(x){c(((x-1)*n+1):(x*n))}))
+          nbr.sub.w <- unlist(lapply(nbr.w,function(x){c(((x-1)*n+1):(x*n))}))
+          sub <- unlist(lapply(varsub,function(x){c(((x-1)*n+1):(x*n))}))
+          sub.w <- unlist(lapply(t,function(x){c(((x-1)*n+1):(x*n))}))
+          res <- list()
+          S=Slist.clq[[l]]
+          nbrsubinv <- rcppeigen_invert_matrix(S[nbr.sub,nbr.sub])
+          res[[1]] <- rcppeigen_invert_matrix(S[sub,sub] - S[sub,nbr.sub] %*% nbrsubinv %*% S[nbr.sub,sub])
+          res[[2]] <- res[[1]]%*%S[sub,nbr.sub] %*% nbrsubinv %*% w[nbr.sub.w]
+          res})
+      }
+      if(length(sep.match)>0){
+        if(length(sep.match==1)){
+          l=sep.match
+          if(length(seps[[l]])==1){
+            #tic()
+            varsub <- which(seps[[l]]==t)
+            sub <- unlist(lapply(varsub,function(x){c(((x-1)*n+1):(x*n))}))
+            res <- list()
+            S <- Slist.sep[[l]]
+            res[[1]] <- rcppeigen_invert_matrix(S[sub,sub])
+            res[[2]] <- rep(0,n)
+          } else {
+            varsub <- which(seps[[l]]==t)
+            nbr <- which(seps[[l]]!=t)
+            nbr.w <- seps[[l]][nbr]
+            nbr.sub <- unlist(lapply(nbr,function(x){c(((x-1)*n+1):(x*n))}))
+            nbr.sub.w <- unlist(lapply(nbr.w,function(x){c(((x-1)*n+1):(x*n))}))
+            sub <- unlist(lapply(varsub,function(x){c(((x-1)*n+1):(x*n))}))
+            sub.w <- unlist(lapply(t,function(x){c(((x-1)*n+1):(x*n))}))
+            res <- list()
+            S=Slist.sep[[l]]
+            nbrsubinv <- rcppeigen_invert_matrix(S[nbr.sub,nbr.sub])
+            res[[1]] <- rcppeigen_invert_matrix(S[sub,sub] - S[sub,nbr.sub] %*% nbrsubinv %*% S[nbr.sub,sub])
+            res[[2]] <- res[[1]]%*%S[sub,nbr.sub] %*% nbrsubinv %*% w[nbr.sub.w]
+          }
+          lsep <- res
+          lsep <- list(lsep)
+          rm(res)
+        } else {
+          lsep <- lapply(sep.match,function(l){ if(length(seps[[l]])==1){
+            #tic()
+            varsub <- which(seps[[l]]==t)
+            nbr <- which(seps[[l]]!=t)
+            nbr.w <- seps[[l]][nbr]
+            nbr.sub <- unlist(lapply(nbr,function(x){c(((x-1)*n+1):(x*n))}))
+            nbr.sub.w <- unlist(lapply(nbr.w,function(x){c(((x-1)*n+1):(x*n))}))
+            sub <- unlist(lapply(varsub,function(x){c(((x-1)*n+1):(x*n))}))
+            sub.w <- unlist(lapply(t,function(x){c(((x-1)*n+1):(x*n))}))
+            res <- list()
+            S <- Slist.sep[[l]]
+            nbrsubinv <- rcppeigen_invert_matrix(S[nbr.sub,nbr.sub])
+            res[[1]] <- rcppeigen_invert_matrix(S[sub,sub]-S[sub,nbr.sub] %*% nbrsubinv %*% S[nbr.sub,sub])
+            res[[2]] <- res[[1]]%*%S[sub,nbr.sub] %*% nbrsubinv %*% w[nbr.sub.w]
+          } else {
+            varsub <- which(seps[[l]]==t)
+            nbr <- which(seps[[l]]!=t)
+            nbr.w <- seps[[l]][nbr]
+            nbr.sub <- unlist(lapply(nbr,function(x){c(((x-1)*n+1):(x*n))}))
+            nbr.sub.w <- unlist(lapply(nbr.w,function(x){c(((x-1)*n+1):(x*n))}))
+            sub <- unlist(lapply(varsub,function(x){c(((x-1)*n+1):(x*n))}))
+            sub.w <- unlist(lapply(t,function(x){c(((x-1)*n+1):(x*n))}))
+            res <- list()
+            S=Slist.sep[[l]]
+            nbrsubinv <- rcppeigen_invert_matrix(S[nbr.sub,nbr.sub])
+            res[[1]] <- rcppeigen_invert_matrix(S[sub,sub] - S[sub,nbr.sub] %*% nbrsubinv %*% S[nbr.sub,sub])
+            res[[2]] <- res[[1]]%*%S[sub,nbr.sub] %*% nbrsubinv %*% w[nbr.sub.w]
+          }
+            res})
+        }
+        cond.sig <- rcppeigen_invert_matrix((1/tausq[t])*diag(o_t) + Reduce(`+`,lapply(lclq,function(x){x[[1]]}))  -
+                                              Reduce(`+`,lapply(lsep,function(x){x[[1]]})))
+        cond.sig <- (cond.sig + t(cond.sig))/2 
+        cond.mu <- cond.sig %*% ((1/tausq[t])*(mu_t) + Reduce(`+`,lapply(lclq,function(x){x[[2]]})) -
+                                   Reduce(`+`,lapply(lsep,function(x){x[[2]]})))
+        #toc()
+      } else {
+        cond.sig <- rcppeigen_invert_matrix((1/tausq[t])*diag(o_t) + Reduce(`+`,lapply(lclq,function(x){x[[1]]})))
+        cond.sig <- (cond.sig + t(cond.sig))/2 
+        cond.mu <-cond.sig %*% ((1/tausq[t])*(mu_t) + Reduce(`+`,lapply(lclq,function(x){x[[2]]})))
+      }
+      as.numeric(mvrnormArma(1,mu=cond.mu,sigma=cond.sig))
+    })
+    toc()
+    if(length(m)==1){
+      wl[[m]] <- as.numeric(w.store[[1]])
+      etest <- rnorm(n*test.prop,sd=sqrt(tausq[m]))
+      Ytest[[m]] <- X.test[,m] * beta[m] + as.numeric(w.store[[1]][test.sample[[m]]]) + etest
+    } else {
+      for(i in 1:length(m)){
+        wl[[m[i]]] <- as.numeric(w.store[[i]])
+        etest <- rnorm(n*test.prop,sd=sqrt(tausq[m[i]]))
+        Ytest[[m[i]]] <- X.test[,m[i]] * beta[m[i]] + as.numeric(w.store[[i]][test.sample[[m[i]]]]) + etest
+      }
+    }
+    w <- unlist(wl)
+  }
+  
+  # Update likelihood values based on new draws of latent processes
+  lik.clq.temp <- lapply(1:length(clqs),function(c){
+    varsub <- clqs[[c]]
+    sub <- unlist(lapply(varsub,function(x){c(((x-1)*n+1):(x*n))}))
+    S_Y <- w[sub] %*% t(w[sub])
+    return(list(S_Y,ellK(K=rcppeigen_invert_matrix(Slist.clq[[c]]),S=S_Y,n=1)))})
+  
+  lik.sep.temp <- lapply(2:length(seps),function(c){
+    varsub <- seps[[c]]
+    sub <- unlist(lapply(varsub,function(x){c(((x-1)*n+1):(x*n))}))
+    S_Y <- w[sub] %*% t(w[sub])
+    return(list(S_Y,ellK(K=rcppeigen_invert_matrix(Slist.sep[[c]]),S=S_Y,n=1)))})
+  
+  
+  lik.clq <- lapply(lik.clq.temp, "[[", 2)
+  Sy.clq.list <- lapply(lik.clq.temp, "[[", 1)
+  
+  lik.sep <- lapply(lik.sep.temp, "[[", 2)
+  Sy.sep.list <- lapply(lik.sep.temp, "[[", 1)
+  
+  lik.sep <- append(100,lik.sep)
+  Sy.sep.list <- append(100,Sy.sep.list)
+  
+  rm(lik.clq.temp)
+  rm(lik.sep.temp)
+  
+  
+  # Part 2: simulate correlation parameters using Metropolis-hastings
+  # g : (-1,1) -> R is a function that maps the correlation values to real line, thus allowing us to use normal distribution as a proposal distribution
+  g=function(x){log((1+x)/(1-x))}
+  gprime=function(x){
+    2/(1-x^2)
+  }
+  ginv = function(x){
+    (exp(x)-1)/(exp(x)+1)
+  }
+  
+ if(length(clqs_2)){
+    for(k in c(1:length(unique(coloring_e)))){
+      m = which(coloring_e==(k-1))
+      rup <- lapply(m, function(t)
+      {lclq <- lsep <- 0
+  # checking cliques corresponding to specific correlation
+  clqt <- clqmatchedge[[t]] 
+  sept <- sepmatchedge[[t]]
+  # summing up clique likelihoods
+  lclq <- sum(sapply(clqt,function(x){lik.clq[[x]]})) 
+  if(length(sept)>0){
+    lsep <- sum(sapply(sept,function(x){lik.sep[[x]]}))
+  }
+  lik.v <- -(lclq-lsep)
+  r=0
+  theta_t = theta[t]
+  ita_t=g(theta_t)
+  ita_t1 = rnorm(1,ita_t,0.4)
+  theta_t1=ginv(ita_t1)
+  thetanew <- theta
+  thetanew[t] <- theta_t1
+  Su=fill.offdiagonal.one(thetanew,t)
+  Slnew=list(clq=Su$Slc,sep=Su$Sls)
+  Rlnew=list(clq=Su$Rlc,sep=Su$Rls)
+  lik.up <- comp.lik.oneedge(t=t,S.clq=Slnew$clq,S.sep=Slnew$sep,R.clq=Rlnew$clq,R.sep=Rlnew$sep)
+  lik.v <- c(lik.v,lik.up$lik)
+  r=min(c(1,exp((-lik.v[2]+lik.v[1]) + log(abs(gprime(theta_t)/gprime(theta_t1))) + dnorm(ita_t1, log = TRUE) - dnorm(ita_t, log=TRUE))))
+  u=runif(1)
+  Slnew <- list(clq=lapply(clqt,function(x){Slnew$clq[[x]]}),sep=lapply(sept,function(x){Slnew$sep[[x]]}))
+  Rlnew <- list(clq=lapply(clqt,function(x){Rlnew$clq[[x]]}),sep=lapply(sept,function(x){Rlnew$sep[[x]]}))
+  if(u > r){
+    list(NULL)
+  } else {
+    list(thetanew[t],Slnew,Rlnew,lik.up,lik.v)
+  }
+  })
+      
+      for(t in 1:length(m)){
+        if(!is.null(rup[[t]][[1]])){
+          clqt <- clqmatchedge[[m[t]]]
+          sept <- sepmatchedge[[m[t]]]
+          theta[m[t]] <- rup[[t]][[1]]
+          sigmahat.mat <- fill.offdiagonal.one(theta,m[t])$sigma
+          for(c in 1:length(clqt)){
+            Slist.clq[[clqt[c]]] <- rup[[t]][[2]]$clq[[c]]
+            Rlist.clq[[clqt[c]]]<- rup[[t]][[3]]$clq[[c]]
+            lik.clq[[clqt[c]]] <- rup[[t]][[4]]$lclq[c]
+          }
+          if(length(sept)>0){
+            for(c in 1:length(sept)){
+              Slist.sep[[sept[c]]] <- rup[[t]][[2]]$sep[[c]]
+              Rlist.sep[[sept[c]]] <- rup[[t]][[3]]$sep[[c]]
+              lik.sep[[sept[c]]] <- rup[[t]][[4]]$lsep[c]
+            }
+          }
+          #counter[m[t],j] <- 1
+        }
+      }
+    }
+ }
+
+  mcmc.store$betahat[j,]=beta
+  mcmc.store$rhat[j,]=theta
+  mcmc.store$tausqhat[j,]=tausq
+  mcmc.store$phihat[j,]= diag(phihat.mat)
+  mcmc.store$sigmahat[j,]=diag(sigmahat.mat)
+  for(k in 1:q){
+    mcmc.store$ytestpred[j,k,]=as.numeric(Ytest[[k]])
+  }
+  print(j)
+  toc()
+}
+```
+
+
+# Results 
+
+We create three plots below among true and estimated parameters for - (1) product of marginal scale and variance parameter ($\sigma_{ii}$), (2) cross-correlation parameter ($r_{ij}$) and (3) product of cross-covariance and cross-scale parameter ($\sigma_{ij}*\phi_{ij}$). The points on all the plots align on the $y=x$ line thus showing the accuracy of our estimation. We also create a plot across $10$ variables showing true test data values and predicted values from our model. The points align on $y=x$ line and mean-square error varied from $0.403$ to $1.064$.
+
+```{r}
+ccc = 5 # cache_indicator
+df=list(mcmc.store)
+burnin=150
+thin=2
+N <- dim(df[[1]]$rhat)[1]
+samples_after_burnin <- c(1:N)[-c(1:burnin)]
+samples <- samples_after_burnin[seq(1, length(samples_after_burnin),by=thin)]
+  
+s2 <- 1
+rhatmcmc <- mcmc.list(lapply(s2,function(x){mcmc(df[[x]]$rhat[samples,])}))
+phihatmcmc <- lapply(s2,function(x){diag(df[[x]]$phihat)})
+sigmahatmcmc <- lapply(s2,function(x){diag(df[[x]]$sigmahat)})
+phisigmahatmcmc <- lapply(s2,function(x){diag(df[[x]]$phihat * df[[x]]$sigmahat)})
+betahatmcmc <- lapply(s2,function(x){mcmc(df[[x]]$betahat)})
+# test location prediction
+ytestpredmcmc <- mcmc.list(lapply(s2,function(x){mcmc(simp.mat(df[[x]]$ytestpred[samples,,]))}))
+ytestpredmcmc2 <- lapply(1:q, function(y){mcmc.list(lapply(s2,function(x){mcmc(df[[x]]$ytestpred[samples,y,])}))})
+wmcmc <- mcmc.list(lapply(s2,function(x){mcmc(simp.mat(df[[x]]$w[samples,,]))}))
+
+# cross-correlation estimates
+rhat <- colMeans(as.matrix(rhatmcmc),na.rm = TRUE)
+rhat_interv <- HPDinterval(rhatmcmc)[[1]]
+rhat_lower <- rhat_interv[,1]
+rhat_upper <- rhat_interv[,2]
+
+# sigma_ij*phi_ij
+true2 <- unlist(lapply(clqs_2,function(x){df[[1]]$sigma[x[1],x[2]] * df[[1]]$phi[x[1],x[2]]}))
+rhatmcmcv2 <- unlist(lapply(1:length(clqs_2),function(u){
+      v <- clqs_2[[u]]
+      sqrt(sigmahatmcmc[[1]][v[1]] * sigmahatmcmc[[1]][v[2]]) * ((phihatmcmc[[1]][v[1]]^0.5) * (phihatmcmc[[1]][v[2]]^0.5)) * rhat[u]
+    }))
+
+rhatmcmcv2_lower <- unlist(lapply(1:length(clqs_2),function(u){
+      v <- clqs_2[[u]]
+      sqrt(sigmahatmcmc[[1]][v[1]] * sigmahatmcmc[[1]][v[2]]) * ((phihatmcmc[[1]][v[1]]^0.5) * (phihatmcmc[[1]][v[2]]^0.5)) * rhat_lower[u]
+    }))
+
+
+rhatmcmcv2_upper <- unlist(lapply(1:length(clqs_2),function(u){
+      v <- clqs_2[[u]]
+      sqrt(sigmahatmcmc[[1]][v[1]] * sigmahatmcmc[[1]][v[2]]) * ((phihatmcmc[[1]][v[1]]^0.5) * (phihatmcmc[[1]][v[2]]^0.5)) * rhat_upper[u]
+    }))
+
+# Scale* variance values
+data.frame(true=diag(df[[1]]$sigma)*diag(df[[1]]$phi), est=phihatmcmc[[1]]*sigmahatmcmc[[1]]) %>% ggplot(aes(x=true,y=est)) + geom_point() + labs(y="True cross-correlation",x="Estimated cross-correlation") + geom_abline(slope = 1, intercept = 0,col="Red") + labs(y=expression(paste("Scale-variance product estimates (", hat(sigma^2*phi),")")), x= expression(paste("Scale-variance product true values (", sigma^2*phi,")")))
+
+
+# Plot true vs estimated scaled cross-correlation
+data.frame(true=true, est=rhat) %>% ggplot(aes(x=true,y=est)) + geom_point() + geom_errorbar(aes(ymin=rhat_lower,ymax=rhat_upper)) +  labs(x=expression(paste("Cross-correlation true values (",r[ij],")")),y=expression(paste("Cross-correlation estimtates (",hat(r)[ij],")"))) + geom_abline(slope = 1, intercept = 0,col="Red") + theme(axis.text=element_text(size=12),axis.title=element_text(size=14,face="bold"))
+
+# Plot true vs estimated sigma_ij*phi_ij
+data.frame(true=true2, est=rhatmcmcv2, est_lower=rhatmcmcv2_lower, est_upper=rhatmcmcv2_upper) %>% ggplot(aes(x=true,y=est)) + geom_point() + geom_errorbar(aes(ymin = est_lower, ymax = est_upper)) + geom_abline(slope = 1, intercept = 0, col="Red") + labs(y=expression(paste("Cross-scale * cross-covariance estimates (", hat(sigma[ij]*phi[ij]),")")), x= expression(paste("Cross-scale * cross-covariance true values (", sigma[ij]*phi[ij],")")))
+
+
+# Plot true test data vs predictions
+ypred = sapply(1:q, function(x){colMeans(ytestpredmcmc2[[x]][[1]],na.rm=TRUE)})
+ypred_lower= sapply(1:q, function(x){HPDinterval(ytestpredmcmc2[[x]])[[1]][,1]})
+ypred_upper= sapply(1:q, function(x){HPDinterval(ytestpredmcmc2[[x]])[[1]][,2]})
+
+
+predvstrue= data.frame(true= as.numeric(mcmc.store$ytest), pred= as.numeric(ypred), pred_lower=as.numeric(ypred_lower), pred_upper=as.numeric(ypred_upper), var=rep(1:q, each=(n*test.prop)))
+predmse= predvstrue %>% group_by(var) %>% summarize(mse=mean((true-pred)^2,na.rm=TRUE))
+predvstrue= predvstrue %>% full_join(predmse) %>% mutate(var_mse=paste0("Var = ",var, ", MSE= ", round(mse,3)))
+predvstrue %>% ggplot(aes(x=true,y=pred)) + geom_point() + 
+  geom_errorbar(aes(ymin=ypred_lower,ymax=ypred_upper)) + 
+  geom_abline(slope=1,intercept = 0, col="Red") + facet_wrap(~var_mse, scales='free_y') + labs(x="True values", y="Predicted values") +  theme(axis.text=element_text(size=12),axis.title=element_text(size=14,face="bold"))
+
+```
+
+
+
+
+
